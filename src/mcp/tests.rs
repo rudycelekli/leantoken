@@ -2913,3 +2913,47 @@ fn search_query_preserves_significant_whitespace() {
 
     assert_eq!(request.query, "  exact text  ");
 }
+#[tokio::test]
+async fn repository_alias_discovery_keeps_all_approved_contexts_dormant() {
+    let (server, primary) = LeanTokenMcp::pending();
+    let mut services = vec![primary];
+    for index in 0..MAX_REPOSITORY_CONTEXTS {
+        let context = McpServices::starting_default();
+        server
+            .contexts
+            .register(
+                format!("context-{index}{}", "x".repeat(55)),
+                context.clone(),
+            )
+            .expect("approved context capacity");
+        services.push(context);
+    }
+    let listing = server.list_receipt_resources(None);
+    assert_eq!(listing.resources.len(), 1);
+    assert_eq!(
+        listing.resources[0].uri,
+        "leantoken://repository-contexts/v1"
+    );
+    let response = server
+        .read_receipt_resource("leantoken://repository-contexts/v1".into(), None)
+        .await
+        .expect("discovery succeeds before any repository becomes ready");
+    let ReadResourceResponse::Complete(response) = response else {
+        panic!("repository alias discovery must complete in one bounded response");
+    };
+    let response = serde_json::to_value(response).expect("resource result");
+    let text = response["contents"][0]["text"]
+        .as_str()
+        .expect("repository alias discovery must return JSON text");
+    let value: serde_json::Value = serde_json::from_str(text).expect("context catalog JSON");
+    let aliases = value["contexts"]
+        .as_array()
+        .expect("approved context aliases");
+    assert_eq!(aliases.len(), MAX_REPOSITORY_CONTEXTS + 1);
+    assert!(aliases.iter().any(|alias| alias["name"] == "default"));
+    assert!(text.len() <= 1_024, "bounded names-only discovery response");
+    for context in services {
+        assert!(!context.activation_requested());
+        assert!(matches!(context.get(), McpServiceState::Starting(_)));
+    }
+}

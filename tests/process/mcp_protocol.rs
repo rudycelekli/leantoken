@@ -624,3 +624,159 @@ fn mcp_receipt_rebase_is_cross_process_and_exact_only() {
         "{third_response}"
     );
 }
+#[test]
+fn mcp_discovers_approved_repository_aliases_without_disclosing_roots() {
+    let primary_root = tempfile::tempdir().expect("primary repository");
+    let docs_root = tempfile::tempdir().expect("approved docs repository");
+    let tests_root = tempfile::tempdir().expect("approved tests repository");
+    for (root, name) in [
+        (primary_root.path(), "primary.rs"),
+        (docs_root.path(), "docs.rs"),
+        (tests_root.path(), "tests.rs"),
+    ] {
+        std::fs::write(root.join(name), "pub fn marker() -> u8 { 1 }\n")
+            .expect("repository source");
+    }
+    std::fs::write(
+        primary_root.path().join(".leantoken.toml"),
+        format!(
+            "[repository_contexts.docs]\nroot = {:?}\nallow_external = true\n\
+             [repository_contexts.tests]\nroot = {:?}\nallow_external = true\n",
+            docs_root.path().to_string_lossy(),
+            tests_root.path().to_string_lossy(),
+        ),
+    )
+    .expect("approved aliases configured by operator");
+    let database = primary_root.path().join("index.sqlite");
+    let mut process = McpProcess::spawn(primary_root.path(), &database);
+    process.initialize();
+    process.send_initialized();
+
+    process.send(serde_json::json!({
+        "jsonrpc": "2.0", "id": 1301, "method": "resources/list"
+    }));
+    let listing = process.response(Duration::from_secs(10));
+    assert_eq!(listing["id"], 1301);
+    let resources = listing["result"]["resources"]
+        .as_array()
+        .expect("MCP resource catalog");
+    let catalog = resources
+        .iter()
+        .find(|resource| resource["uri"] == "leantoken://repository-contexts/v1")
+        .expect("approved aliases must be discoverable through MCP resources/list");
+    assert_eq!(catalog["mimeType"], "application/json");
+
+    process.send(serde_json::json!({
+        "jsonrpc": "2.0", "id": 1302, "method": "resources/read",
+        "params": {"uri": catalog["uri"]}
+    }));
+    let response = process.response(Duration::from_secs(10));
+    assert_eq!(response["id"], 1302);
+    let text = response["result"]["contents"][0]["text"]
+        .as_str()
+        .expect("JSON context catalog resource");
+    let discovery: serde_json::Value = serde_json::from_str(text).expect("context catalog JSON");
+    assert_eq!(discovery["schema_version"], 1);
+    assert_eq!(discovery["kind"], "repository_contexts");
+    let aliases = discovery["contexts"]
+        .as_array()
+        .expect("bounded approved aliases");
+    assert_eq!(
+        aliases,
+        &vec![
+            serde_json::json!({"name": "default"}),
+            serde_json::json!({"name": "docs"}),
+            serde_json::json!({"name": "tests"}),
+        ]
+    );
+    for root in [primary_root.path(), docs_root.path(), tests_root.path()] {
+        let root_text = root.to_string_lossy();
+        assert!(!listing.to_string().contains(root_text.as_ref()));
+        assert!(!text.contains(root_text.as_ref()));
+    }
+
+    process.wait_until_ready(Duration::from_secs(30));
+    let mut repository_ids = std::collections::BTreeSet::new();
+    let mut default_repository_id = None;
+    for (index, alias) in aliases.iter().enumerate() {
+        let name = alias["name"].as_str().expect("discovered request alias");
+        let id = 1310 + index;
+        process.send(serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": "files", "arguments": {
+                "repository_context": name,
+                "operation": {"kind": "tree", "path": ".", "max_results": 10}
+            }}
+        }));
+        let selected = process.response(Duration::from_secs(30));
+        assert_eq!(selected["id"], id);
+        assert_ne!(selected["result"]["isError"], true, "{selected}");
+        let expected_path = match name {
+            "default" => "primary.rs",
+            "docs" => "docs.rs",
+            "tests" => "tests.rs",
+            _ => panic!("unexpected alias {name}"),
+        };
+        assert!(selected.to_string().contains(expected_path), "{selected}");
+        let repository_id = selected["result"]["structuredContent"]["meta"]["repository_id"]
+            .as_str()
+            .expect("selected repository identity")
+            .to_owned();
+        if name == "default" {
+            default_repository_id = Some(repository_id.clone());
+        }
+        repository_ids.insert(repository_id);
+    }
+    assert_eq!(repository_ids.len(), 3);
+
+    for (id, arguments) in [
+        (
+            1315,
+            serde_json::json!({
+                "operation": {"kind": "tree", "path": ".", "max_results": 10}
+            }),
+        ),
+        (
+            1316,
+            serde_json::json!({
+                "repository_context": null,
+                "operation": {"kind": "tree", "path": ".", "max_results": 10}
+            }),
+        ),
+    ] {
+        process.send(serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": "files", "arguments": arguments}
+        }));
+        let selected = process.response(Duration::from_secs(30));
+        assert_eq!(selected["id"], id);
+        assert_eq!(
+            selected["result"]["structuredContent"]["meta"]["repository_id"].as_str(),
+            default_repository_id.as_deref(),
+        );
+    }
+
+    process.send(serde_json::json!({
+        "jsonrpc": "2.0", "id": 1320, "method": "tools/call",
+        "params": {"name": "files", "arguments": {
+            "repository_context": "unapproved",
+            "operation": {"kind": "tree", "path": ".", "max_results": 10}
+        }}
+    }));
+    let rejected = process.response(Duration::from_secs(10));
+    assert_eq!(rejected["id"], 1320);
+    assert_eq!(rejected["result"]["isError"], true);
+    assert_eq!(
+        rejected["result"]["structuredContent"]["category"],
+        "invalid_input"
+    );
+
+    process.send(serde_json::json!({
+        "jsonrpc": "2.0", "id": 1321, "method": "resources/read",
+        "params": {"uri": "leantoken://repository-contexts/v1/unapproved"}
+    }));
+    let unknown_resource = process.response(Duration::from_secs(10));
+    assert_eq!(unknown_resource["id"], 1321);
+    assert_eq!(unknown_resource["error"]["code"], -32002);
+    process.stop();
+}
