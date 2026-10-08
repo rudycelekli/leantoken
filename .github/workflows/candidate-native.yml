@@ -1,0 +1,119 @@
+name: Bounded owned-fork native evidence
+
+"on":
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Reviewed immutable owned-fork source commit (40 hex characters)
+        required: true
+        type: string
+      lane:
+        description: One existing canonical Linux validation lane
+        required: true
+        type: choice
+        options: [npm, product, examples, rust-quality]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: candidate-native-evidence
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  evidence:
+    if: github.repository == 'rudycelekli/leantoken'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Admit exactly one reviewed immutable source and lane
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          EVIDENCE_LANE: ${{ inputs.lane }}
+        run: |
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 2
+          case "$EVIDENCE_LANE" in
+            npm|product|examples|rust-quality) ;;
+            *) exit 2 ;;
+          esac
+
+      - name: Checkout immutable evidence source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+
+      - name: Verify checked-out source identity
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          [[ "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]] || exit 2
+          git status --porcelain
+          git rev-parse HEAD >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install canonical Rust toolchain
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: "1.95"
+          components: rustfmt, clippy
+
+      - name: Install canonical Node
+        if: inputs.lane == 'npm'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+
+      - name: Install canonical nextest
+        if: inputs.lane == 'product' || inputs.lane == 'rust-quality'
+        uses: taiki-e/install-action@bb0282cdd6e41599bc8dfa5fc712ebe9e27cfd8c # nextest
+
+      - name: Cache dependency graph by evidence lane
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: candidate-native-${{ inputs.lane }}
+          cache-workspace-crates: true
+
+      - name: Run one canonical validation lane
+        env:
+          EVIDENCE_LANE: ${{ inputs.lane }}
+        run: |
+          case "$EVIDENCE_LANE" in
+            npm)
+              node --test npm/npm-packaging.test.mjs
+              node --test npm/npm-install-e2e.mjs
+              ;;
+            product)
+              cargo xtask test product --profile ci
+              ;;
+            examples)
+              cargo test --locked --package leantoken-benchmarks --bins
+              cargo test --locked --workspace --all-features --doc
+              python3 -m unittest scripts/test_agent_walltime_ab.py scripts/test_paired_performance.py
+              ;;
+            rust-quality)
+              cargo metadata --locked --format-version 1 > /dev/null
+              cargo fmt --all -- --check
+              cargo xtask check-test-architecture
+              cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+              RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
+              ;;
+            *) exit 2 ;;
+          esac
+
+      - name: Preserve bounded native test diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: candidate-native-${{ inputs.lane }}-${{ inputs.source_sha }}
+          path: |
+            target/nextest/
+            target/test-failures/
+          if-no-files-found: ignore
+          retention-days: 7
