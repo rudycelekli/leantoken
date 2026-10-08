@@ -1774,3 +1774,382 @@ fn cancellation_between_preparation_batches_stops_before_the_next_batch() {
     assert!(matches!(error, Error::Cancelled));
     assert_eq!(batches, 1);
 }
+
+const STAGED_READ_WORK_BOUND: usize = 128;
+const RELATIONAL_MUTATION_WORK_BOUND: usize = 256;
+
+fn staged_cancellation_fixture() -> (tempfile::TempDir, Storage, Indexer) {
+    let root = tempfile::tempdir().expect("root");
+    let mut source = String::new();
+    for index in 0..512 {
+        fs::write(
+            root.path().join(format!("dep_{index:04}.ts")),
+            format!("export const value_{index:04} = {index};\n"),
+        )
+        .expect("dependency");
+        source.push_str(&format!(
+            "import {{ value_{index:04} }} from './dep_{index:04}';\n"
+        ));
+    }
+    for index in 0..2048 {
+        source.push_str(&format!(
+            "export function item_{index:04}() {{ return value_{:04}; }}\n",
+            index % 512
+        ));
+    }
+    fs::write(root.path().join("entry.ts"), source).expect("source");
+    let mut config =
+        Config::discover(root.path(), Some(root.path().join("index.sqlite"))).expect("config");
+    config.chunk_lines = 1;
+    config.chunk_bytes = 256;
+    config.max_index_workers = 1;
+    let storage = Storage::open(&config.database_path).expect("storage");
+    let indexer = Indexer::new(Arc::new(config), storage.clone()).expect("indexer");
+    let initial = indexer
+        .reconcile(IndexingMode::Reconcile)
+        .expect("producer baseline");
+    assert_eq!(
+        initial.files_indexed, 513,
+        "all actual filesystem fixture files are admitted"
+    );
+    (root, storage, indexer)
+}
+
+fn cancellation_table_count(storage: &Storage, table: &str) -> usize {
+    let connection = rusqlite::Connection::open(&storage.path).expect("reader");
+    connection
+        .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+            row.get::<_, usize>(0)
+        })
+        .expect("derived row count")
+}
+
+fn cancellation_database_snapshot(storage: &Storage) -> Vec<(String, Vec<Vec<String>>)> {
+    let connection = rusqlite::Connection::open(&storage.path).expect("snapshot reader");
+    let mut statement = connection
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+        .expect("table inventory");
+    let names = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("inventory")
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .expect("table names");
+    names
+        .into_iter()
+        .map(|name| {
+            let quoted = name.replace('"', "\"\"");
+            let mut statement = connection
+                .prepare(&format!("SELECT * FROM \"{quoted}\""))
+                .expect("table snapshot");
+            let width = statement.column_count();
+            let mut records = statement
+                .query_map([], |row| {
+                    (0..width)
+                        .map(|column| Ok(format!("{:?}", row.get_ref(column)?)))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .expect("records")
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .expect("all records");
+            records.sort();
+            (name, records)
+        })
+        .collect()
+}
+
+fn assert_cancelled_publication_rolled_back(
+    storage: &Storage,
+    generation: u64,
+    snapshot: Vec<(String, Vec<Vec<String>>)>,
+) {
+    assert_eq!(
+        storage.repository_generation().expect("generation"),
+        generation
+    );
+    assert_eq!(
+        cancellation_database_snapshot(storage),
+        snapshot,
+        "every ordinary, derived and FTS table must retain its committed rows"
+    );
+    let connection = rusqlite::Connection::open(&storage.path).expect("independent writer");
+    connection
+        .busy_timeout(std::time::Duration::ZERO)
+        .expect("no wait");
+    connection
+        .execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
+        .expect("rollback must release the production writer");
+}
+
+fn cancellation_during_staged_read(table: &'static str, production_table: &str) {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let (_root, storage, indexer) = staged_cancellation_fixture();
+    assert!(
+        cancellation_table_count(&storage, production_table) > STAGED_READ_WORK_BOUND,
+        "actual parser-produced fixture must exceed the declared row-work bound"
+    );
+    let generation = storage.repository_generation().expect("generation");
+    let snapshot = cancellation_database_snapshot(&storage);
+    let cancellation = CancellationToken::new();
+    let observed = Arc::new(AtomicUsize::new(0));
+    let count = observed.clone();
+    let triggered = Arc::new(AtomicBool::new(false));
+    let trigger = cancellation.clone();
+    let result = Storage::with_staged_read_observer_for_test(
+        move |observed_table| {
+            if observed_table == table && !triggered.swap(true, Ordering::SeqCst) {
+                trigger.cancel();
+            }
+            if triggered.load(Ordering::SeqCst) {
+                count.fetch_add(1, Ordering::SeqCst);
+            }
+        },
+        || indexer.reconcile_cancellable(IndexingMode::Rebuild, &cancellation),
+    );
+    assert!(
+        matches!(result, Err(Error::Cancelled)),
+        "actual result: {result:?}"
+    );
+    let rows = observed.load(Ordering::SeqCst);
+    assert!(
+        rows > 0,
+        "cancellation must occur within an actual stage row mapper"
+    );
+    assert_cancelled_publication_rolled_back(&storage, generation, snapshot);
+    eprintln!("staged cancellation read table={table} rows_since_cancel={rows}");
+    assert!(
+        rows <= STAGED_READ_WORK_BOUND,
+        "{table}: read {rows} rows after cancellation instead of observing it within the declared bound"
+    );
+}
+
+struct CancellationUpdateHook(Storage);
+
+impl Drop for CancellationUpdateHook {
+    fn drop(&mut self) {
+        self.0
+            .writer
+            .lock()
+            .expect("writer")
+            .update_hook(None::<fn(rusqlite::hooks::Action, &str, &str, i64)>);
+    }
+}
+
+fn cancellation_update_hook(
+    storage: &Storage,
+    table: &'static str,
+    action: rusqlite::hooks::Action,
+    cancellation: &CancellationToken,
+) -> (CancellationUpdateHook, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let triggered = Arc::new(AtomicBool::new(false));
+    let observed = Arc::new(AtomicUsize::new(0));
+    let count = observed.clone();
+    let trigger = cancellation.clone();
+    storage.writer.lock().expect("writer").update_hook(Some(
+        move |observed_action, _database: &str, observed_table: &str, _row_id| {
+            if observed_action == action
+                && observed_table == table
+                && !triggered.swap(true, Ordering::SeqCst)
+            {
+                trigger.cancel();
+            }
+            if triggered.load(Ordering::SeqCst)
+                && matches!(
+                    observed_table,
+                    "files"
+                        | "chunks"
+                        | "symbols"
+                        | "symbol_refs"
+                        | "imports"
+                        | "import_candidates"
+                        | "path_entries"
+                )
+            {
+                count.fetch_add(1, Ordering::SeqCst);
+            }
+        },
+    ));
+    (CancellationUpdateHook(storage.clone()), observed)
+}
+
+fn cancellation_during_relational_insert(table: &'static str) {
+    use std::sync::atomic::Ordering;
+    let (_root, storage, indexer) = staged_cancellation_fixture();
+    assert!(
+        cancellation_table_count(&storage, table) > RELATIONAL_MUTATION_WORK_BOUND,
+        "actual producer must supply enough rows for a meaningful bound assertion"
+    );
+    let generation = storage.repository_generation().expect("generation");
+    let snapshot = cancellation_database_snapshot(&storage);
+    let cancellation = CancellationToken::new();
+    let (hook, observed) = cancellation_update_hook(
+        &storage,
+        table,
+        rusqlite::hooks::Action::SQLITE_INSERT,
+        &cancellation,
+    );
+    let result = indexer.reconcile_cancellable(IndexingMode::Rebuild, &cancellation);
+    drop(hook);
+    assert!(
+        matches!(result, Err(Error::Cancelled)),
+        "actual result: {result:?}"
+    );
+    let rows = observed.load(Ordering::SeqCst);
+    assert!(
+        rows > 0,
+        "cancellation must be injected during a real SQLite mutation"
+    );
+    assert_cancelled_publication_rolled_back(&storage, generation, snapshot);
+    eprintln!("staged cancellation insert table={table} relational_mutations_since_cancel={rows}");
+    assert!(
+        rows <= RELATIONAL_MUTATION_WORK_BOUND,
+        "{table}: {rows} relational mutations continued after cancellation"
+    );
+}
+
+fn cancellation_during_targeted_path_publication(relocate: bool) {
+    use std::sync::atomic::Ordering;
+    let root = tempfile::tempdir().expect("root");
+    for index in 0..512 {
+        fs::write(
+            root.path().join(format!("old_{index:04}.rs")),
+            format!("pub fn item_{index:04}() -> usize {{ {index} }}\n"),
+        )
+        .expect("source");
+    }
+    let config =
+        Config::discover(root.path(), Some(root.path().join("index.sqlite"))).expect("config");
+    let storage = Storage::open(&config.database_path).expect("storage");
+    let indexer = Indexer::new(Arc::new(config), storage.clone()).expect("indexer");
+    indexer
+        .reconcile(IndexingMode::Reconcile)
+        .expect("producer baseline");
+    let generation = storage.repository_generation().expect("generation");
+    let snapshot = cancellation_database_snapshot(&storage);
+    let mut paths = Vec::new();
+    for index in 0..512 {
+        let old = format!("old_{index:04}.rs");
+        paths.push(old.clone());
+        if relocate {
+            let new = format!("new_{index:04}.rs");
+            fs::rename(root.path().join(&old), root.path().join(&new)).expect("rename");
+            paths.push(new);
+        } else {
+            fs::remove_file(root.path().join(&old)).expect("remove");
+        }
+    }
+    let cancellation = CancellationToken::new();
+    let action = if relocate {
+        rusqlite::hooks::Action::SQLITE_UPDATE
+    } else {
+        rusqlite::hooks::Action::SQLITE_DELETE
+    };
+    let (hook, observed) = cancellation_update_hook(&storage, "files", action, &cancellation);
+    let result = indexer.reconcile_paths_cancellable(&paths, &cancellation);
+    drop(hook);
+    let rows = observed.load(Ordering::SeqCst);
+    eprintln!(
+        "targeted cancellation result={result:?} relocate={relocate} mutations_since_cancel={rows} generation_after={}",
+        storage.repository_generation().expect("generation")
+    );
+    assert!(
+        matches!(result, Err(Error::Cancelled)),
+        "actual result: {result:?}"
+    );
+    assert!(
+        rows > 0,
+        "the intended targeted SQLite mutation must have occurred"
+    );
+    assert_cancelled_publication_rolled_back(&storage, generation, snapshot);
+    eprintln!(
+        "staged cancellation targeted relocate={relocate} relational_mutations_since_cancel={rows}"
+    );
+    assert!(
+        rows <= RELATIONAL_MUTATION_WORK_BOUND,
+        "targeted relocate={relocate}: {rows} mutations continued after cancellation"
+    );
+}
+
+#[test]
+fn staged_chunk_reads_observe_mid_apply_cancellation() {
+    cancellation_during_staged_read("chunks", "chunks");
+}
+
+#[test]
+fn staged_symbol_reads_observe_mid_apply_cancellation() {
+    cancellation_during_staged_read("symbols", "symbols");
+}
+
+#[test]
+fn staged_reference_reads_observe_mid_apply_cancellation() {
+    cancellation_during_staged_read("references", "symbol_refs");
+}
+
+#[test]
+fn staged_import_reads_observe_mid_apply_cancellation() {
+    cancellation_during_staged_read("imports", "imports");
+}
+
+#[test]
+fn staged_candidate_reads_observe_mid_apply_cancellation() {
+    cancellation_during_staged_read("import_candidates", "import_candidates");
+}
+
+#[test]
+fn staged_files_inserts_observe_mid_apply_cancellation() {
+    cancellation_during_relational_insert("files");
+}
+
+#[test]
+fn staged_chunks_inserts_observe_mid_apply_cancellation() {
+    cancellation_during_relational_insert("chunks");
+}
+
+#[test]
+fn staged_symbols_inserts_observe_mid_apply_cancellation() {
+    cancellation_during_relational_insert("symbols");
+}
+
+#[test]
+fn staged_symbol_refs_inserts_observe_mid_apply_cancellation() {
+    cancellation_during_relational_insert("symbol_refs");
+}
+
+#[test]
+fn staged_imports_inserts_observe_mid_apply_cancellation() {
+    cancellation_during_relational_insert("imports");
+}
+
+#[test]
+fn staged_import_candidates_inserts_observe_mid_apply_cancellation() {
+    cancellation_during_relational_insert("import_candidates");
+}
+
+#[test]
+fn targeted_removals_observe_mid_apply_cancellation() {
+    cancellation_during_targeted_path_publication(false);
+}
+
+#[test]
+fn targeted_relocations_observe_mid_apply_cancellation() {
+    cancellation_during_targeted_path_publication(true);
+}
+
+#[test]
+fn staged_read_observer_without_cancellation_preserves_committed_success() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (_root, storage, indexer) = staged_cancellation_fixture();
+    let rows = Arc::new(AtomicUsize::new(0));
+    let observed = rows.clone();
+    let result = Storage::with_staged_read_observer_for_test(
+        move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+        },
+        || indexer.reconcile_cancellable(IndexingMode::Rebuild, &CancellationToken::new()),
+    )
+    .expect("a non-aborting observer must preserve ordinary publication");
+    assert_eq!(result.repository_generation, 2);
+    assert_eq!(storage.repository_generation().expect("generation"), 2);
+    assert_eq!(result.files_indexed, 513);
+    assert!(rows.load(Ordering::SeqCst) > STAGED_READ_WORK_BOUND);
+}

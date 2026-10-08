@@ -6,6 +6,48 @@ use std::time::Instant;
 
 use tempfile::TempDir;
 
+#[cfg(test)]
+type StagedReadObserver = Box<dyn FnMut(&'static str)>;
+
+#[cfg(test)]
+thread_local! {
+    static STAGED_READ_OBSERVER: std::cell::RefCell<Option<StagedReadObserver>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn observe_staged_read_for_test(table: &'static str) {
+    STAGED_READ_OBSERVER.with(|observer| {
+        if let Some(observer) = observer.borrow_mut().as_mut() {
+            observer(table);
+        }
+    });
+}
+
+#[cfg(test)]
+impl Storage {
+    pub(crate) fn with_staged_read_observer_for_test<T>(
+        observer: impl FnMut(&'static str) + 'static,
+        operation: impl FnOnce() -> T,
+    ) -> T {
+        struct ResetObserver;
+        impl Drop for ResetObserver {
+            fn drop(&mut self) {
+                STAGED_READ_OBSERVER.with(|observer| {
+                    observer.borrow_mut().take();
+                });
+            }
+        }
+        STAGED_READ_OBSERVER.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            assert!(slot.is_none(), "staged read observers must not nest");
+            *slot = Some(Box::new(observer));
+        });
+        let _reset = ResetObserver;
+        operation()
+    }
+}
+
 const STAGE_FORMAT_VERSION: i64 = 2;
 
 const STAGE_SCHEMA_SQL: &str = r#"
@@ -524,6 +566,8 @@ impl FinalizedReconciliation {
             )?;
             statement
                 .query_map(params![row.id], |row| {
+                    #[cfg(test)]
+                    observe_staged_read_for_test("chunks");
                     Ok(ChunkInput {
                         content: row.get(0)?,
                         start_line: i64_to_usize(row.get(1)?)?,
@@ -542,6 +586,8 @@ impl FinalizedReconciliation {
             )?;
             statement
                 .query_map(params![row.id], |row| {
+                    #[cfg(test)]
+                    observe_staged_read_for_test("symbols");
                     Ok(SymbolInput {
                         name: row.get(0)?,
                         kind: row.get(1)?,
@@ -562,6 +608,8 @@ impl FinalizedReconciliation {
             )?;
             statement
                 .query_map(params![row.id], |row| {
+                    #[cfg(test)]
+                    observe_staged_read_for_test("references");
                     Ok(ReferenceInput {
                         name: row.get(0)?,
                         kind: row.get(1)?,
@@ -583,6 +631,8 @@ impl FinalizedReconciliation {
                 )?;
                 statement
                     .query_map(params![row.id], |row| {
+                        #[cfg(test)]
+                        observe_staged_read_for_test("imports");
                         Ok((
                             row.get::<_, i64>(0)?,
                             ImportInput {
@@ -603,7 +653,11 @@ impl FinalizedReconciliation {
                          WHERE import_id = ?1 ORDER BY priority",
                     )?;
                     import.candidate_paths = candidates
-                        .query_map(params![id], |row| row.get::<_, String>(0))?
+                        .query_map(params![id], |row| {
+                            #[cfg(test)]
+                            observe_staged_read_for_test("import_candidates");
+                            row.get::<_, String>(0)
+                        })?
                         .collect::<std::result::Result<Vec<_>, _>>()?;
                     Ok(import)
                 })
