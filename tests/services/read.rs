@@ -2266,3 +2266,215 @@ async fn bounded_continuation_cursor_rejects_full_policy_switch() {
         .expect_err("policy switch must fail");
     assert!(matches!(error, Error::StaleCursor));
 }
+
+fn target_metadata_request(path: &str, max_tokens: usize) -> ReadRequest {
+    ReadRequest {
+        path: path.into(),
+        start_line: None,
+        end_line: None,
+        symbol: None,
+        heading: None,
+        heading_occurrence: None,
+        continuation_cursor: None,
+        max_tokens: Some(max_tokens),
+        expected_hash: None,
+        delta: false,
+        receipt_id: None,
+        policy: leantoken::ReadPolicy::Bounded,
+    }
+}
+
+async fn assert_known_target_pages(
+    services: &Services,
+    mut request: ReadRequest,
+    expected_end: usize,
+    file_bytes: usize,
+) {
+    let path = request.path.clone();
+    let mut generation = None;
+    for _ in 0..3 {
+        let page = services.read(request).await.expect("bounded target page");
+        assert_eq!(
+            page.target_end_line, expected_end,
+            "a finite resolved end must not become the scan frontier"
+        );
+        let json = serde_json::to_value(&page).expect("serialize target page");
+        assert_eq!(json["target_end_status"], "known");
+        let observed = json["observed_live_end_line"]
+            .as_u64()
+            .expect("explicit live observation frontier");
+        assert!(observed < expected_end as u64);
+        assert!(page.returned_end_line <= observed as usize);
+        assert!(page.live_bytes_read < file_bytes);
+        assert!(page.meta.source_tokens <= 8);
+        assert_response_token_accounting!(page, Tokenizer::Cl100kBase);
+        if let Some(expected) = generation {
+            assert_eq!(page.meta.repository_generation, expected);
+        } else {
+            generation = Some(page.meta.repository_generation);
+        }
+        assert!(page.truncated);
+        request = target_metadata_request(&path, 8);
+        request.continuation_cursor = Some(page.continuation_cursor.expect("next target page"));
+    }
+}
+
+#[tokio::test]
+async fn read_preserves_explicit_target_end_across_bounded_pages() {
+    let source = "x\n".repeat(100_000);
+    let (_root, services) = indexed_source("long.md", source.as_bytes()).await;
+    let mut request = target_metadata_request("long.md", 8);
+    request.start_line = Some(1);
+    request.end_line = Some(100_000);
+    assert_known_target_pages(&services, request, 100_000, source.len()).await;
+}
+
+#[tokio::test]
+async fn read_preserves_symbol_target_end_across_bounded_pages() {
+    let source = format!("pub fn target() {{\n{}}}\n", "// x\n".repeat(20_000));
+    let (_root, services) = indexed_source("long.rs", source.as_bytes()).await;
+    let mut request = target_metadata_request("long.rs", 8);
+    request.symbol = Some("target".into());
+    assert_known_target_pages(&services, request, 20_002, source.len()).await;
+}
+
+#[tokio::test]
+async fn read_preserves_heading_target_end_across_bounded_pages() {
+    let source = format!("## target\n{}", "x\n".repeat(100_000));
+    let (_root, services) = indexed_source("long.md", source.as_bytes()).await;
+    let mut request = target_metadata_request("long.md", 8);
+    request.heading = Some("target".into());
+    assert_known_target_pages(&services, request, 100_001, source.len()).await;
+}
+
+#[tokio::test]
+async fn read_open_target_distinguishes_unknown_frontier_until_actual_eof() {
+    let source = "x\n".repeat(100_000);
+    let (_root, services) = indexed_source("long.md", source.as_bytes()).await;
+    let mut request = target_metadata_request("long.md", 8);
+    let mut combined = String::new();
+    let mut generation = None;
+    for _ in 0..3 {
+        let page = services.read(request).await.expect("open bounded page");
+        let json = serde_json::to_value(&page).expect("serialize open page");
+        assert_eq!(json["target_end_status"], "unknown");
+        assert_eq!(json["observed_live_end_line"], page.target_end_line);
+        assert!(page.target_end_line < 100_000);
+        assert!(page.live_bytes_read < source.len());
+        assert!(page.meta.source_tokens <= 8);
+        assert_response_token_accounting!(page, Tokenizer::Cl100kBase);
+        if let Some(expected) = generation {
+            assert_eq!(page.meta.repository_generation, expected);
+        } else {
+            generation = Some(page.meta.repository_generation);
+        }
+        combined.push_str(page.content.as_deref().expect("source page"));
+        assert!(page.truncated);
+        request = target_metadata_request("long.md", 8);
+        request.continuation_cursor = Some(page.continuation_cursor.expect("next page"));
+    }
+    // Larger later pages keep this EOF proof bounded in calls, without changing
+    // the cursor's target or policy.
+    request.max_tokens = Some(32_000);
+    for _ in 0..12 {
+        let page = services.read(request).await.expect("continue toward EOF");
+        assert_eq!(Some(page.meta.repository_generation), generation);
+        combined.push_str(page.content.as_deref().expect("continued source"));
+        let json = serde_json::to_value(&page).expect("serialize final coordinates");
+        assert_response_token_accounting!(page, Tokenizer::Cl100kBase);
+        if !page.truncated {
+            assert_eq!(json["target_end_status"], "known");
+            assert_eq!(json["observed_live_end_line"], 100_000);
+            assert_eq!(page.target_end_line, 100_000);
+            assert!(page.continuation_cursor.is_none());
+            assert_eq!(combined, source);
+            return;
+        }
+        request = target_metadata_request("long.md", 32_000);
+        request.continuation_cursor = Some(page.continuation_cursor.expect("remaining page"));
+    }
+    panic!("the owned 200,000-byte target must finish within twelve larger pages");
+}
+
+#[tokio::test]
+async fn read_does_not_infer_eof_when_budget_stops_at_metadata_size() {
+    // Exactly one token-check window: consuming all metadata-sized bytes is
+    // still not an EOF read when the budget stop ends the stream first.
+    let source = "x\n".repeat(32_768);
+    let (_root, services) = indexed_source("boundary.md", source.as_bytes()).await;
+    let mut request = target_metadata_request("boundary.md", 8);
+    request.start_line = Some(1);
+    request.end_line = Some(100_000);
+    let bounded = services
+        .read(request.clone())
+        .await
+        .expect("boundary bounded read");
+    assert_eq!(bounded.live_bytes_read, source.len());
+    assert!(bounded.truncated);
+    assert_eq!(bounded.target_end_line, 100_000);
+    let json = serde_json::to_value(&bounded).expect("boundary metadata");
+    assert_eq!(json["target_end_status"], "known");
+    assert_eq!(json["observed_live_end_line"], 32_768);
+    request.policy = leantoken::ReadPolicy::Full;
+    let full = services
+        .read(request)
+        .await
+        .expect("actual EOF observation");
+    assert_eq!(full.target_end_line, 32_768);
+}
+
+#[tokio::test]
+async fn read_clamps_eof_shortened_indexed_symbol_to_actual_live_end() {
+    let indexed = format!("pub fn target() {{\n{}}}\n", "// x\n".repeat(20_000));
+    let (root, services) = indexed_source("shortened.rs", indexed.as_bytes()).await;
+    let live = "pub fn target() {\n// short\n}\n";
+    std::fs::write(root.path().join("shortened.rs"), live).expect("shorten live symbol");
+    let mut request = target_metadata_request("shortened.rs", 100);
+    request.symbol = Some("target".into());
+    let page = services.read(request).await.expect("EOF-shortened symbol");
+    assert_eq!(page.target_end_line, 3);
+    assert_eq!(page.returned_end_line, 3);
+    assert_eq!(page.content.as_deref(), Some(live));
+    assert!(!page.truncated);
+    assert!(page.continuation_cursor.is_none());
+}
+
+#[tokio::test]
+async fn read_full_and_bounded_coordinates_agree_after_eof() {
+    let source = "alpha\nbeta\ngamma\n";
+    let (_root, services) = indexed_source("small.md", source.as_bytes()).await;
+    let request = target_metadata_request("small.md", 100);
+    let bounded = services.read(request.clone()).await.expect("bounded EOF");
+    let mut full_request = request;
+    full_request.policy = leantoken::ReadPolicy::Full;
+    let full = services.read(full_request).await.expect("full EOF");
+    assert_eq!(bounded.target_start_line, full.target_start_line);
+    assert_eq!(bounded.target_end_line, 3);
+    assert_eq!(bounded.target_end_line, full.target_end_line);
+    assert_eq!(bounded.returned_start_line, full.returned_start_line);
+    assert_eq!(bounded.returned_end_line, full.returned_end_line);
+    assert_eq!(bounded.content, full.content);
+    assert_eq!(bounded.live_bytes_read, source.len());
+    assert_eq!(full.live_bytes_read, source.len());
+    assert!(!bounded.truncated && !full.truncated);
+}
+
+#[tokio::test]
+async fn read_legacy_response_endpoint_deserializes_conservatively() {
+    let (_root, services) = indexed_source("legacy.md", b"alpha\nbeta\ngamma\n").await;
+    let page = services
+        .read(target_metadata_request("legacy.md", 100))
+        .await
+        .expect("native legacy-shaped response");
+    let original_end = page.target_end_line;
+    let mut legacy = serde_json::to_value(page).expect("serialize native response");
+    let object = legacy.as_object_mut().expect("response object");
+    object.remove("target_end_status");
+    object.remove("observed_live_end_line");
+    let decoded: leantoken::ReadResponse =
+        serde_json::from_value(legacy).expect("deserialize older numeric response");
+    assert_eq!(decoded.target_end_line, original_end);
+    let json = serde_json::to_value(decoded).expect("serialize conservative metadata");
+    assert_eq!(json["target_end_status"], "unknown");
+    assert!(json.get("observed_live_end_line").is_none());
+}
